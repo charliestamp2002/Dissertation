@@ -1,22 +1,32 @@
-import json
 import gzip
+import json
 import numpy as np
 import pandas as pd
 import pathlib
+import os
+import joblib
 
-def load_tracking_data(tracking_dir, n_files=None):
+
+def load_tracking_data(tracking_dir="tracking-compressed", n_files=3, block_size=250, num_blocks=50, seed=42):
     """
-    Load compressed JSON tracking data from tracking_dir.
+    Loads and samples tracking data from JSON.gz files.
+    
+    Args:
+        tracking_dir (str or Path): Directory containing compressed tracking files.
+        n_files (int): Number of files to load.
+        block_size (int): Number of frames in each block.
+        num_blocks (int): Number of blocks to sample per file.
+        seed (int): Random seed for reproducibility.
 
     Returns:
-        frames_df
-        players_df
-        used_match_ids
+        frames_df (pd.DataFrame): DataFrame containing frame-level ball info.
+        players_df (pd.DataFrame): DataFrame containing player tracking data.
+        used_match_ids (list): List of match IDs processed.
     """
+    tracking_dir = pathlib.Path(tracking_dir)
     json_gz_paths = sorted(tracking_dir.glob("tracking_*.json.gz"))
 
-    if n_files is None:
-        n_files = len(json_gz_paths)
+    print(len(json_gz_paths), "tracking files found")
 
     frames = []
     players = []
@@ -26,79 +36,341 @@ def load_tracking_data(tracking_dir, n_files=None):
         match_id = json_gz_path.stem
         used_match_ids.append(match_id)
 
-        records = []
+        # First pass: count lines
         with gzip.open(json_gz_path, "rt", encoding="utf-8") as f:
-            for line in f:
-                records.append(json.loads(line))
+            total_lines = sum(1 for _ in f)
 
-        for r in records:
-            f_data = {
-                "match_id": match_id,
-                "period": r["period"],
-                "frameIdx": r["frameIdx"],
-                "gameClock": r["gameClock"],
-                "lastTouch_team": r["lastTouch"],
-                "ball_x": r["ball"]["xyz"][0],
-                "ball_y": r["ball"]["xyz"][1],
-                "ball_z": r["ball"]["xyz"][2],
-            }
-            frames.append(f_data)
+        max_possible_blocks = (total_lines - block_size) // block_size
+        num_blocks_to_sample = min(num_blocks, max_possible_blocks)
+        if num_blocks_to_sample <= 0:
+            continue
 
-            for side in ["homePlayers", "awayPlayers"]:
-                for p in r[side]:
-                    px, py, pz = p["xyz"]
-                    players.append({
-                        "match_id": match_id,
-                        "period": r["period"],
-                        "frameIdx": r["frameIdx"],
-                        "side": "home" if side == "homePlayers" else "away",
-                        "playerId": p["playerId"],
-                        "optaId": str(p["optaId"]),
-                        "number": p["number"],
-                        "x": px,
-                        "y": py,
-                        "z": pz,
-                        "speed": p["speed"],
-                    })
+        possible_starts = np.arange(0, total_lines - block_size + 1, block_size)
+        rng = np.random.default_rng(seed)
+        chosen_starts = rng.choice(possible_starts, size=num_blocks_to_sample, replace=False)
+        sampled_indices = set()
+        for start in chosen_starts:
+            sampled_indices.update(range(start, start + block_size))
+
+        # Second pass: read only selected frames
+        with gzip.open(json_gz_path, "rt", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i not in sampled_indices:
+                    continue
+                r = json.loads(line)
+
+                # Frame-level data
+                frames.append({
+                    "match_id": match_id,
+                    "period": r["period"],
+                    "frameIdx": r["frameIdx"],
+                    "gameClock": r["gameClock"],
+                    "lastTouch_team": r["lastTouch"],
+                    "ball_x": r["ball"]["xyz"][0],
+                    "ball_y": r["ball"]["xyz"][1],
+                    "ball_z": r["ball"]["xyz"][2],
+                })
+
+                # Player tracking data
+                for side in ["homePlayers", "awayPlayers"]:
+                    for p in r[side]:
+                        px, py, pz = p["xyz"]
+                        players.append({
+                            "match_id": match_id,
+                            "period": r["period"],
+                            "frameIdx": r["frameIdx"],
+                            "side": "home" if side == "homePlayers" else "away",
+                            "playerId": p["playerId"],
+                            "optaId": str(p["optaId"]),
+                            "number": p["number"],
+                            "x": px,
+                            "y": py,
+                            "z": pz,
+                            "speed": p["speed"],
+                        })
 
     frames_df = pd.DataFrame(frames)
     players_df = pd.DataFrame(players)
 
     return frames_df, players_df, used_match_ids
 
+def extract_event_metadata(events_path):
+    """Extract match date and team names from a StatsBomb event file."""
+    teams = set()
+    match_date = None
 
-def load_metadata(metadata_dir, used_match_ids):
+    with open(events_path, "r", encoding="utf-8-sig") as f:
+        for line in f:
+            obj = json.loads(line)
+            if match_date is None and "match_date" in obj:
+                match_date = obj["match_date"]
+            if "team" in obj and obj["team"] is not None:
+                teams.add(obj["team"]["name"])
+            if "possession_team" in obj and obj["possession_team"] is not None:
+                teams.add(obj["possession_team"]["name"])
+
+    return {
+        "events_file": str(events_path),
+        "match_date": match_date,
+        "team_names": list(teams),
+    }
+
+def load_event_metadata(events_dir="statsbomb_pl_data"):
+    """Load metadata from all StatsBomb event files."""
+    events_dir = pathlib.Path(events_dir)
+    event_files = sorted(events_dir.glob("*.json"))
+    metadata = [extract_event_metadata(path) for path in event_files]
+    return pd.DataFrame(metadata)
+
+def load_tracking_metadata(metadata_dir="metadata_SecondSpectrum"):
+    """Load match metadata from Second Spectrum tracking files."""
+    metadata_dir = pathlib.Path(metadata_dir)
+    metadata_files = list(metadata_dir.glob("*.json"))
+
+    records = []
+    for path in metadata_files:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            meta = json.load(f)
+
+        if all(k in meta for k in ["year", "month", "day"]):
+            match_date = f"{meta['year']:04}-{meta['month']:02}-{meta['day']:02}"
+        else:
+            match_date = None
+
+        desc = meta.get("description", "")
+        home_team, away_team = None, None
+        if " - " in desc:
+            teams_part = desc.split(":")[0].strip()
+            home_team, away_team = teams_part.split(" - ")
+
+        if path.stem.startswith("metadata_g"):
+            suffix = path.stem.split("_")[1]
+        else:
+            suffix = path.stem.split("_")[0]
+
+        records.append({
+            "metadata_path": str(path),
+            "tracking_suffix": suffix,
+            "match_date": match_date,
+            "home_team": home_team,
+            "away_team": away_team,
+        })
+
+    return pd.DataFrame(records)
+
+def match_events_to_tracking(event_meta_df, tracking_meta_df, team_code_map):
+    """Match StatsBomb events to Second Spectrum tracking files using date + team."""
+    tracking_meta_df = tracking_meta_df.copy()
+    tracking_meta_df["home_team_full"] = tracking_meta_df["home_team"].map(team_code_map)
+    tracking_meta_df["away_team_full"] = tracking_meta_df["away_team"].map(team_code_map)
+
+    tracking_long = pd.concat([
+        tracking_meta_df.assign(team_name=tracking_meta_df["home_team_full"]),
+        tracking_meta_df.assign(team_name=tracking_meta_df["away_team_full"]),
+    ])
+    tracking_long["key"] = (
+        tracking_long["match_date"].fillna("") + "_" +
+        tracking_long["team_name"].fillna("")
+    )
+
+    events_exploded = event_meta_df.explode("team_names")
+    events_exploded["team_name"] = events_exploded["team_names"].fillna("")
+    events_exploded["key"] = (
+        events_exploded["match_date"].fillna("") + "_" +
+        events_exploded["team_name"].fillna("")
+    )
+
+    merged = events_exploded.merge(
+        tracking_long,
+        on="key",
+        how="left",
+        suffixes=("", "_tracking")
+    )
+
+    clean_df = (
+        merged
+        .dropna(subset=["tracking_suffix"])
+        .drop_duplicates(subset=["events_file"])
+        .reset_index(drop=True)
+    )
+
+    return clean_df
+
+def add_event_timestamps(events_df):
+    """Adds absolute and period-normalized seconds to StatsBomb event DataFrame."""
+    events_df["minute"] = events_df["minute"].fillna(0).astype(int)
+    events_df["second"] = events_df["second"].fillna(0).astype(int)
+    #events_df["milliseconds"] = events_df.get("milliseconds", 0).fillna(0).astype(int)
+    if "milliseconds" in events_df.columns:
+        events_df["milliseconds"] = events_df["milliseconds"].fillna(0).astype(int)
+    else:
+        events_df["milliseconds"] = 0
+
+    events_df["seconds_absolute"] = (
+        events_df["minute"] * 60 +
+        events_df["second"] +
+        events_df["milliseconds"] / 1000
+    )
+    events_df["seconds_period"] = events_df["seconds_absolute"]  # alias
+    return events_df
+
+
+def match_events_to_frames(events_df, frames_df_match):
     """
-    Loads Second Spectrum metadata JSONs.
+    Assigns the nearest frameIdx to each event by comparing game clock times.
+    """
+    period_to_frame_times = {
+        period: group[["seconds_period", "frameIdx"]].sort_values("seconds_period")
+        for period, group in frames_df_match.groupby("period")
+    }
+
+    assigned_frames, frame_diffs = [], []
+
+    for _, e in events_df.iterrows():
+        period = e["period"]
+        seconds_event = e["seconds_period"]
+
+        if period not in period_to_frame_times:
+            assigned_frames.append(None)
+            frame_diffs.append(None)
+            continue
+
+        times = period_to_frame_times[period]["seconds_period"].values
+        frames = period_to_frame_times[period]["frameIdx"].values
+
+        idx = np.argmin(np.abs(times - seconds_event))
+        assigned_frames.append(frames[idx])
+        frame_diffs.append(np.abs(times[idx] - seconds_event))
+
+    events_df["frameIdx"] = assigned_frames
+    events_df["frame_diff"] = frame_diffs
+    return events_df
+
+
+def find_events_during_run(run_df, events_df):
+    """
+    Filters events_df to those overlapping with the frame range of a given run.
+    """
+    period = run_df["period"].iloc[0]
+    start_frame = run_df["frameIdx"].min()
+    end_frame = run_df["frameIdx"].max()
+
+    return events_df[
+        (events_df["period"] == period) &
+        (events_df["frameIdx"] >= start_frame) &
+        (events_df["frameIdx"] <= end_frame)
+    ]
+
+
+def load_and_align_events(frames_df, players_df, event_tracking_df_clean, cache_path="events_dfs_by_match.joblib"):
+    """
+    Loads and aligns StatsBomb event data to tracking frames for valid matches.
+    """
+    # Normalize match_id format
+    frames_df["match_id"] = frames_df["match_id"].str.replace(".json", "", regex=False)
+    players_df["match_id"] = players_df["match_id"].str.replace(".json", "", regex=False)
+
+    valid_tracking_ids = set(frames_df["match_id"].unique())
+    filtered_df = event_tracking_df_clean[
+        event_tracking_df_clean["tracking_suffix"].apply(lambda s: f"tracking_{s}").isin(valid_tracking_ids)
+    ]
+
+    if os.path.exists(cache_path):
+        print(" Loaded precomputed events_dfs_by_match.")
+        return joblib.load(cache_path)
+
+    events_dfs_by_match = {}
+
+    for _, row in filtered_df.iterrows():
+        events_path = row["events_file"]
+        tracking_suffix = row["tracking_suffix"]
+        tracking_match_id = f"tracking_{tracking_suffix}"
+
+        frames_df_match = frames_df[frames_df["match_id"] == tracking_match_id].copy()
+        players_df_match = players_df[players_df["match_id"] == tracking_match_id]
+
+        with open(events_path, "r", encoding="utf-8-sig") as f:
+            event_rows = [json.loads(line) for line in f]
+        events_df = pd.DataFrame(event_rows)
+        events_df = add_event_timestamps(events_df)
+
+        # Align frame clocks
+        frames_df_match["seconds_period"] = frames_df_match.apply(
+            lambda row: row["gameClock"] + (0 if row["period"] == 1 else 2700), axis=1
+        )
+
+        # Filter events per valid period and align with frames
+        valid_periods = frames_df_match["period"].unique()
+        filtered_events = []
+        for period in valid_periods:
+            f_period = frames_df_match[frames_df_match["period"] == period]
+            e_period = events_df[events_df["period"] == period]
+            if f_period.empty or e_period.empty:
+                continue
+            start_sec = f_period["seconds_period"].min()
+            filtered_events.append(e_period[e_period["seconds_period"] >= start_sec])
+
+        events_df = pd.concat(filtered_events, ignore_index=True)
+        events_df = match_events_to_frames(events_df, frames_df_match)
+
+        events_dfs_by_match[tracking_match_id] = events_df
+
+    joblib.dump(events_dfs_by_match, cache_path)
+    print(" Saved events_dfs_by_match to disk.")
+    return events_dfs_by_match
+
+def build_opta_metadata(players_df, used_match_ids, metadata_dir="metadata_SecondSpectrum"):
+    """
+    Loads Second Spectrum metadata files, maps player names/positions/optaIds to tracking data.
+
+    Args:
+        players_df (pd.DataFrame): DataFrame containing player tracking data.
+        used_match_ids (list): List of tracking match IDs (e.g., "tracking_g2444470").
+        metadata_dir (str or Path): Path to the Second Spectrum metadata directory.
 
     Returns:
-        meta_df
+        players_df (pd.DataFrame): Updated with player_name, position, team_role.
+        metadata_df (pd.DataFrame): Player metadata lookup with optaId.
+        metadata_dict (dict): Surname → optaId mapping for quick lookup.
     """
-    used_match_suffixes = [match_id.split("_", 1)[1].replace(".json", "") for match_id in used_match_ids]
-
+    metadata_dir = pathlib.Path(metadata_dir)
     all_metadata_files = list(metadata_dir.glob("*.json"))
 
+    # Step 1: Extract suffixes from match IDs
+    used_suffixes = [match_id.split("_", 1)[1].replace(".json", "") for match_id in used_match_ids]
+
+    # Step 2: Build file map
     metadata_file_map = {}
     for path in all_metadata_files:
-        filename = path.name
-        if filename.startswith("metadata_g") and filename.endswith(".json"):
-            suffix = filename.split("_")[1].split(".")[0]
-        elif filename.endswith("_SecondSpectrum_Metadata.json"):
-            suffix = filename.split("_")[0]
+        fname = path.name
+        if fname.startswith("metadata_g") and fname.endswith(".json"):
+            suffix = fname.split("_")[1].split(".")[0]
+        elif fname.endswith("_SecondSpectrum_Metadata.json"):
+            suffix = fname.split("_")[0]
         else:
             continue
         metadata_file_map[suffix] = path
 
+    # Step 3: Extract metadata for tracking suffixes
     opta_meta_lookup = {}
+    meta_records = []
 
-    for suffix in used_match_suffixes:
+    for suffix in used_suffixes:
         metadata_path = metadata_file_map.get(suffix)
         if not metadata_path:
-            print(f"No metadata found for match {suffix}")
+            print(f" No metadata found for match {suffix}")
             continue
 
         with open(metadata_path, "r", encoding="utf-8-sig") as f:
             meta = json.load(f)
+
+        meta_records.append({
+            "match_date": meta.get("matchDate"),
+            "home_team": meta.get("homeTeamName"),
+            "away_team": meta.get("awayTeamName"),
+            "tracking_suffix": suffix,
+            "metadata_path": str(metadata_path),
+        })
 
         match_id = f"tracking_{suffix}"
 
@@ -111,6 +383,9 @@ def load_metadata(metadata_dir, used_match_ids):
                     "team_role": team,
                 }
 
+    print(f" Loaded metadata for {len(opta_meta_lookup)} players.")
+
+    # Build DataFrame from lookup
     meta_df = pd.DataFrame([
         {
             "match_id": match_id,
@@ -122,293 +397,61 @@ def load_metadata(metadata_dir, used_match_ids):
         for (match_id, opta_id), info in opta_meta_lookup.items()
     ])
 
-    return meta_df
-
-
-def merge_player_metadata(players_df, meta_df):
-    """
-    Merges player tracking DataFrame with metadata DataFrame.
-    """
+    # Merge into players_df
+    players_df = players_df.copy()
     players_df["match_id_clean"] = players_df["match_id"].str.replace(".json", "", regex=False)
 
-    merged = players_df.merge(
+    players_df = players_df.merge(
         meta_df,
         how="left",
         left_on=["match_id_clean", "optaId"],
         right_on=["match_id", "optaId"]
     )
 
-    merged.drop(columns=["match_id_clean", "match_id_y"], inplace=True, errors="ignore")
-    merged.rename(columns={"match_id_x": "match_id"}, inplace=True)
+    players_df.drop(columns=["match_id_clean", "match_id_y"], inplace=True, errors="ignore")
+    players_df.rename(columns={"match_id_x": "match_id"}, inplace=True)
 
-    return merged
+    # Build name→optaId dictionary using surnames
+    def extract_surname(name):
+        if pd.isna(name) or name is None:
+            return ""
+        name = name.lower().strip()
+        parts = name.split()
+        return parts[-1] if parts else ""
 
+    metadata_df = meta_df.copy()
+    metadata_df["surname"] = metadata_df["player_name"].apply(extract_surname)
+    metadata_dict = dict(
+        zip(metadata_df["surname"], metadata_df["optaId"].astype(str))
+    )
 
-def segment_runs(players_df, speed_threshold=2.0):
+    return players_df, metadata_df, metadata_dict
+
+def extract_surname(name):
+    if pd.isna(name) or name is None:
+        return ""
+    name = name.lower().strip()
+    parts = name.split()
+    return parts[-1] if parts else ""
+
+def merge_assignments_with_metadata(assignments_df, final_runs_df, cluster_col):
     """
-    Segments continuous runs for each player where speed > threshold.
+    Adds player metadata to each run in the cluster assignments.
+    
+    Args:
+        assignments_df (pd.DataFrame): Contains 'run_id' and cluster column (e.g. 'ae_cluster').
+        final_runs_df (pd.DataFrame): Original dataframe of all runs.
+        cluster_col (str): Name of the column containing cluster assignments.
+
+    Returns:
+        pd.DataFrame: Merged dataframe with metadata and cluster assignment.
     """
-    runs = []
-    for (match_id, period, playerId), group in players_df.groupby(["match_id", "period", "playerId"]):
-        group = group.sort_values("frameIdx")
-        current_run = []
-        for _, row in group.iterrows():
-            if row["speed"] > speed_threshold:
-                current_run.append(row)
-            elif current_run:
-                runs.append(pd.DataFrame(current_run))
-                current_run = []
-        if current_run:
-            runs.append(pd.DataFrame(current_run))
-    return runs
-
-
-def filter_off_ball_runs_with_distance(runs_list, frames_df, players_df, min_distance=3.0):
-    """
-    Filters runs:
-    - player never touched ball
-    - always at least `min_distance` from the ball
-    """
-    frame_last_touch = frames_df.set_index(["match_id", "period", "frameIdx"])["lastTouch_team"].to_dict()
-    ball_positions = frames_df.set_index(["match_id", "period", "frameIdx"])[["ball_x", "ball_y"]].to_dict("index")
-
-    off_ball_runs = []
-
-    for run_df in runs_list:
-        player_id = run_df["playerId"].iloc[0]
-        match_id = run_df["match_id"].iloc[0]
-        period = run_df["period"].iloc[0]
-        frame_idxs = run_df["frameIdx"].values
-
-        is_off_ball = True
-        for frame_idx in frame_idxs:
-            key = (match_id, period, frame_idx)
-
-            if frame_last_touch.get(key) == player_id:
-                is_off_ball = False
-                break
-
-            ball_pos = ball_positions.get(key)
-            if ball_pos is None:
-                continue
-
-            player_pos = run_df[run_df["frameIdx"] == frame_idx][["x", "y"]].values
-            if player_pos.size == 0:
-                continue
-
-            dist = np.linalg.norm(player_pos[0] - np.array([ball_pos["ball_x"], ball_pos["ball_y"]]))
-            if dist < min_distance:
-                is_off_ball = False
-                break
-
-        if is_off_ball:
-            off_ball_runs.append(run_df)
-
-    return off_ball_runs
-
-def annotate_runs_with_metadata(runs_list):
-    # Annotate each run with player metadata
-    annotated_runs = []
-
-    for run_df in runs_list:
-        # Make a copy of the run to avoid modifying in-place
-        run_df = run_df.copy()
-
-        # Extract metadata from the first row (same for entire run)
-        meta_fields = ["playerId", "optaId", "match_id", "player_name", "position", "team_role"]
-        for field in meta_fields:
-            run_df[field] = run_df.iloc[0][field]
-
-        annotated_runs.append(run_df)
-
-    # Assign a unique run_id to each run
-    for i, run_df in enumerate(annotated_runs):
-        run_df["run_id"] = i
-
-    # Optional: Combine into one dataframe
-    all_runs_df = pd.concat(annotated_runs, ignore_index=True)
-
-    return all_runs_df
-
-
-def mirror_group(group):
-    y_mean = group["y"].mean()
-    if y_mean < 0:
-        group["y_mirror"] = -group["y"]
-    else:
-        group["y_mirror"] = group["y"]
-    group["x_mirror"] = group["x"]
-    return group
-
-
-def should_flip_x(team_role, period):
-    if period == 1:
-        return team_role == "away"
-    elif period == 2:
-        return team_role == "home"
-    else:
-        return False
-
-
-def compute_team_centroids(players_df):
-    centroid_dict = {}
-    players_df["number"] = players_df["number"].astype(int)
-
-    for (match_id, period, frame_idx), group in players_df.groupby(["match_id", "period", "frameIdx"]):
-        for side in ["home", "away"]:
-            team_players = group[(group["side"] == side) & (group["number"] != 1)]
-            if not team_players.empty:
-                centroid = team_players[["x", "y"]].mean().values
-            else:
-                centroid = np.array([0.0, 0.0])
-            centroid_dict[(match_id, period, frame_idx, side)] = centroid
-
-    return centroid_dict
-
-
-def build_frame_lookups(frames_df, players_df):
-    frame_last_touch_team = frames_df.set_index(["match_id", "period", "frameIdx"])["lastTouch_team"].to_dict()
-    player_side_lookup = players_df.set_index(["match_id", "period", "frameIdx", "playerId"])["side"].to_dict()
-    return frame_last_touch_team, player_side_lookup
-
-
-def adjust_runs(all_runs_df, centroid_dict, frame_last_touch_team):
-    adjusted_runs_list = []
-
-    grouped = all_runs_df.groupby(["match_id", "period", "playerId", "run_id"], group_keys=False)
-
-    for _, run_df in grouped:
-        run_df = run_df.sort_values("frameIdx")
-        match_id = run_df["match_id"].iloc[0]
-        period = run_df["period"].iloc[0]
-        start_frame = run_df["frameIdx"].iloc[0]
-
-        key = (match_id, period, start_frame)
-        possession_side = frame_last_touch_team.get(key)
-
-        team_role = run_df["team_role"].iloc[0]
-
-        if possession_side is None:
-            in_possession = np.nan
-            phase_of_play = np.nan
-        else:
-            in_possession = (team_role == possession_side)
-            phase_of_play = "attack" if in_possession else "defend"
-
-        run_df["in_possession"] = in_possession
-        run_df["phase_of_play"] = phase_of_play
-
-        team_centroid = centroid_dict.get(
-            (match_id, period, start_frame, team_role),
-            np.array([0.0, 0.0])
-        )
-
-        run_df["x_c"] = run_df["x"] - team_centroid[0]
-        run_df["y_c"] = run_df["y"] - team_centroid[1]
-        run_df["x_mirror_c"] = run_df["x_mirror"] - team_centroid[0]
-        run_df["y_mirror_c"] = run_df["y_mirror"] - team_centroid[1]
-
-        flip_x = should_flip_x(team_role, period)
-        if flip_x:
-            run_df["x_mirror"] = -run_df["x_mirror"]
-            run_df["x_mirror_c"] = -run_df["x_mirror_c"]
-
-        adjusted_runs_list.append(run_df)
-
-    final_runs_df = pd.concat(adjusted_runs_list, ignore_index=True)
-
-    return final_runs_df
-
-def merge_assignments_with_zones(assignments_df, zones_df):
-    assignments_zones = assignments_df.merge(
-        zones_df,
-        on="run_id",
-        how="left"
-    )
-
-    # Clean up duplicates if merge produced suffixes
-    assignments_zones.drop(columns=[
-        "position_y",
-        "team_role_y"
-    ], inplace=True, errors="ignore")
-
-    assignments_zones.rename(columns={
-        "position_x": "position",
-        "team_role_x": "team_role",
-    }, inplace=True)
-
-    return assignments_zones
-
-
-def compute_position_buckets(assignments_zones):
-    # Group and count runs per position
-    position_detail_counts = (
-        assignments_zones
-        .groupby(["assigned_cluster", "position"])
-        .size()
-        .reset_index(name="num_runs")
-        .sort_values(["assigned_cluster", "num_runs"], ascending=[True, False])
-    )
-
-    position_pivot = (
-        position_detail_counts
-        .pivot_table(index="assigned_cluster",
-                     columns="position",
-                     values="num_runs",
-                     fill_value=0)
-        .reset_index()
-    )
-
-    # Mapping of fine-grained positions → high-level buckets
-    position_bucket_map = {
-        "GK": "sub", "SUB": "sub",
-        "CB": "defender", "RCB": "defender", "LCB": "defender",
-        "RB": "defender", "LB": "defender", "RWB": "defender", "LWB": "defender",
-        "CDM": "midfielder", "RDM": "midfielder", "LDM": "midfielder",
-        "CM": "midfielder", "RCM": "midfielder", "LCM": "midfielder",
-        "CAM": "midfielder", "RM": "midfielder", "LM": "midfielder",
-        "LW": "attacker", "RW": "attacker", "ST": "attacker",
-        "CF": "attacker", "RF": "attacker", "LF": "attacker",
-    }
-
-    assignments_zones["position_bucket"] = assignments_zones["position"].map(
-        lambda pos: position_bucket_map.get(pos, "unknown")
-    )
-
-    bucket_counts = (
-        assignments_zones
-        .groupby(["assigned_cluster", "position_bucket"])
-        .size()
-        .reset_index(name="num_runs")
-        .sort_values(["assigned_cluster", "num_runs"], ascending=[True, False])
-    )
-
-    bucket_pivot = (
-        bucket_counts
-        .pivot_table(index="assigned_cluster",
-                     columns="position_bucket",
-                     values="num_runs",
-                     fill_value=0)
-        .reset_index()
-    )
-
-    return position_pivot, bucket_pivot
-
-def merge_assignments_with_run_metadata(assignments_df, final_runs_df):
     runs_meta_df = final_runs_df.groupby("run_id", as_index=False).first()
+    merged_df = assignments_df.merge(runs_meta_df, on="run_id", how="left")
 
-    merged_df = assignments_df.merge(
-        runs_meta_df,
-        on="run_id",
-        how="left"
-    )
-
+    # Drop duplicated columns if needed
     merged_df.drop(columns=[
-        "position_y",
-        "player_name_y",
-        "team_role_y",
-        "match_id_y",
-        "playerId_y",
+        "position_y", "player_name_y", "team_role_y", "match_id_y", "playerId_y"
     ], inplace=True, errors="ignore")
 
     merged_df.rename(columns={
@@ -420,4 +463,62 @@ def merge_assignments_with_run_metadata(assignments_df, final_runs_df):
     }, inplace=True)
 
     return merged_df
+
+def add_position_buckets(df, position_col="position"):
+    """
+    Adds a new column 'position_bucket' mapping fine-grained positions to broad roles.
+    """
+    position_bucket_map = {
+        "GK": "sub", "SUB": "sub",
+        "CB": "defender", "RCB": "defender", "LCB": "defender",
+        "RB": "defender", "LB": "defender", "RWB": "defender", "LWB": "defender",
+        "CDM": "midfielder", "RDM": "midfielder", "LDM": "midfielder",
+        "CM": "midfielder", "RCM": "midfielder", "LCM": "midfielder",
+        "CAM": "midfielder", "RM": "midfielder", "LM": "midfielder",
+        "LW": "attacker", "RW": "attacker", "ST": "attacker",
+        "CF": "attacker", "RF": "attacker", "LF": "attacker",
+    }
+
+    df["position_bucket"] = df[position_col].map(lambda pos: position_bucket_map.get(pos, "unknown"))
+    return df
+
+def compute_position_pivot(df, cluster_col="ae_cluster"):
+    """
+    Returns pivot table: [cluster x position]
+    """
+    position_counts = (
+        df.groupby([cluster_col, "position"])
+        .size()
+        .reset_index(name="num_runs")
+        .sort_values([cluster_col, "num_runs"], ascending=[True, False])
+    )
+
+    pivot = (
+        position_counts
+        .pivot_table(index=cluster_col, columns="position", values="num_runs", fill_value=0)
+        .reset_index()
+    )
+    return pivot
+
+
+def compute_bucket_pivot(df, cluster_col="ae_cluster"):
+    """
+    Returns pivot table: [cluster x position_bucket]
+    """
+    bucket_counts = (
+        df.groupby([cluster_col, "position_bucket"])
+        .size()
+        .reset_index(name="num_runs")
+        .sort_values([cluster_col, "num_runs"], ascending=[True, False])
+    )
+
+    pivot = (
+        bucket_counts
+        .pivot_table(index=cluster_col, columns="position_bucket", values="num_runs", fill_value=0)
+        .reset_index()
+    )
+    return pivot
+
+
+### –––––––––––––––––––––– OLD CODE –––––––––––––––––––––––– ###
 
