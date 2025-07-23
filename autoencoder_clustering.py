@@ -30,7 +30,7 @@ class TrajectoryAutoencoder(nn.Module):
         x_recon = self.decoder(z)
         return x_recon, z
 
-def run_autoencoder_clustering(final_runs_df, num_points=50, k_clusters=70, 
+def run_autoencoder_clustering(final_runs_df, num_points=25, k_clusters=70, 
                                 batch_size=64, epochs=100, lr=1e-3, device=None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

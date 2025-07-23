@@ -27,7 +27,7 @@ class TrajectoryTransformerEncoder(nn.Module):
         return z
 
 
-def run_transformer_clustering(final_runs_df, num_points=50, k_clusters=70):
+def run_transformer_clustering(final_runs_df, num_points=25, k_clusters=70):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Prepare run tensors
@@ -37,6 +37,7 @@ def run_transformer_clustering(final_runs_df, num_points=50, k_clusters=70):
     for run_id in run_ids:
         run_df = final_runs_df[final_runs_df["run_id"] == run_id]
         coords = run_df[["x_mirror_c", "y_mirror_c"]].values
+        #print("Just checking coords shape", coords.shape)
         if coords.shape[0] < 2:
             continue
         resampled = resample_coords(coords, num_points)
@@ -89,6 +90,7 @@ def run_transformer_clustering(final_runs_df, num_points=50, k_clusters=70):
             optimizer.step()
             total_loss += loss.item()
 
+        avg_loss = total_loss / len(loader.dataset) 
         if epoch % 10 == 0 or epoch == epochs - 1:
             print(f"Epoch {epoch}: Loss = {total_loss:.4f}")
 
@@ -120,4 +122,4 @@ def run_transformer_clustering(final_runs_df, num_points=50, k_clusters=70):
         transformer_assignments.append(assignment)
 
     assignments_df = pd.DataFrame(transformer_assignments)
-    return assignments_df, model
+    return assignments_df, model, avg_loss

@@ -3,7 +3,9 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 import random
+from matplotlib.patches import FancyBboxPatch, Circle
 from bezier_clustering import resample_coords, fit_bezier_curve, evaluate_bezier_curve
+
 
 def draw_pitch(ax, pitch_length=105, pitch_width=68):
     half_length = pitch_length / 2
@@ -170,3 +172,5 @@ def plot_all_cluster_trajectories_on_pitch(
     plt.tight_layout()
     plt.suptitle(f"All {title} Run Trajectories per Cluster (On-Pitch View)", fontsize=16, y=1.02)
     plt.show()
+
+

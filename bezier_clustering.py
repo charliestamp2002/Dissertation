@@ -25,7 +25,7 @@ def fit_bezier_curve(coords, num_control_points):
     return control_points
 
 # Equation (4): Evaluate Bézier curve at t using control points θ
-def evaluate_bezier_curve(control_points, num_points=50):
+def evaluate_bezier_curve(control_points, num_points=25):
     P = control_points.shape[0]
     X = bezier_design_matrix(num_points, P)
     return X @ control_points
@@ -33,7 +33,7 @@ def evaluate_bezier_curve(control_points, num_points=50):
 def compute_l1_distance(traj, bezier_curve):
     return np.mean(np.abs(traj - bezier_curve))
 
-def bezier_kmeans_clustering(final_runs_df, adjusted_runs_list, k_clusters=70, num_control_points=4, num_points=50, max_iterations=2, tolerance=1e-3):
+def bezier_kmeans_clustering(final_runs_df, adjusted_runs_list, k_clusters=70, num_control_points=4, num_points=25, max_iterations=10, tolerance=1e-3):
     random.seed(42)
     initial_centroids = random.sample(adjusted_runs_list, k_clusters)
     cluster_control_points = []

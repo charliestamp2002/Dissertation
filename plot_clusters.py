@@ -3,7 +3,7 @@ import numpy as np
 from plotting import plot_all_cluster_trajectories_on_pitch
 
 # === CHOOSE CLUSTERING METHOD HERE ===
-method = "bezier"  # Change to "autoencoder" to plot AE clusters
+method = "transformer"  # Change to "autoencoder" to plot AE clusters
 save_path = None   # Set to "outputs/bezier_clusters.png" to save instead of show
 max_runs_per_cluster = 200
 
@@ -19,12 +19,23 @@ if method == "bezier":
     bucket_pivot = pd.read_pickle("outputs/bezier_bucket_pivot.pkl")
     title = "Bézier+L1"
     is_autoencoder = False
-else:
+
+elif method == "autoencoder":
     assignments_df = pd.read_pickle("outputs/assignments_zones_ae.pkl")
     cluster_control_points = np.load("outputs/autoencoder_cluster_control_points.npy", allow_pickle=True)
     bucket_pivot = pd.read_pickle("outputs/ae_bucket_pivot.pkl")
     title = "Autoencoder"
     is_autoencoder = True
+
+elif method == "transformer":
+    assignments_df = pd.read_pickle("outputs/assignments_zones_transformer.pkl")
+    cluster_control_points = np.load("outputs/transformer_cluster_control_points.npy", allow_pickle=True)
+    bucket_pivot = pd.read_pickle("outputs/transformer_bucket_pivot.pkl")
+    title = "Transformer"
+    is_autoencoder = True  # Transformer doesn't use control points, treat like AE
+
+else:
+    raise ValueError(f"Unsupported method: {method}")
 
 # === Plot all clusters ===
 plot_all_cluster_trajectories_on_pitch(
@@ -42,6 +53,7 @@ plot_all_cluster_trajectories_on_pitch(
 # === Save or Show ===
 if save_path:
     import matplotlib.pyplot as plt
+    plt.figure(figsize=(6, 4))
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     print(f"Plot saved to: {save_path}")
 else:

@@ -519,6 +519,46 @@ def compute_bucket_pivot(df, cluster_col="ae_cluster"):
     )
     return pivot
 
+def get_valid_resampled_tensor(runs_df, num_points=25, return_indices=False):
+    """
+    Filters and resamples trajectories to a fixed number of points (e.g., 25).
+    Only includes runs with at least `num_points` original frames.
+    Returns a NumPy array of shape [N, num_points, 2].
+    """
+    from run_segmentation import resample_coords
+
+    traj_tensor = []
+    valid_run_ids = []
+    skipped = 0
+
+    for run_id in runs_df["run_id"].unique():
+        run = runs_df[runs_df["run_id"] == run_id]
+        coords = run[["x_mirror_c", "y_mirror_c"]].values
+
+        if coords.shape[0] < num_points:
+            skipped += 1
+            continue
+
+        try:
+            resampled = resample_coords(coords, num_points=num_points)
+            if resampled.shape == (num_points, 2):
+                traj_tensor.append(resampled)
+                valid_run_ids.append(run_id)
+            else:
+                skipped += 1
+        except Exception as e:
+            print(f"Error resampling run_id {run_id}: {e}")
+            skipped += 1
+
+    print(f"Total valid runs: {len(traj_tensor)}")
+    print(f"Total skipped runs: {skipped}")
+    
+    stacked = np.stack(traj_tensor)
+    if return_indices:
+        return stacked, valid_run_ids
+    else:
+        return stacked
+
 
 ### –––––––––––––––––––––– OLD CODE –––––––––––––––––––––––– ###
 

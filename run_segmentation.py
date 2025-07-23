@@ -4,7 +4,7 @@ from scipy.interpolate import interp1d
 from data_utils import (extract_surname,
                          find_events_during_run)  # Required to resolve surname lookups from metadata_dict
 
-def resample_coords(coords, num_points=50):
+def resample_coords(coords, num_points=25):
     if len(coords) < 2:
         return np.tile(coords[0], (num_points, 1))
     distances = np.cumsum(np.linalg.norm(np.diff(coords, axis=0), axis=1))
